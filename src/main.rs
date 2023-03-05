@@ -1,3 +1,1 @@
-fn main() {
-    println!("{listing_0037}");
-}
+fn main() {}
