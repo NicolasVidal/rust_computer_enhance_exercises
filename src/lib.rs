@@ -1,8 +1,11 @@
+use std::cmp::Ordering;
 use std::slice::Iter;
 
 const MOV_REG_REG_MEM: (u8, u8) = (0b00100010, 2);
 const MOV_IM_REG_MEM: (u8, u8) = (0b01100011, 1);
 const MOV_IM_REG: (u8, u8) = (0b00001011, 4);
+const MOV_MEM_TO_ACC: (u8, u8) = (0b01010000, 1);
+const MOV_ACC_TO_MEM: (u8, u8) = (0b01010001, 1);
 
 fn match_op(data: u8, op_and_displacement: (u8, u8)) -> bool {
     (data >> op_and_displacement.1) == op_and_displacement.0
@@ -33,34 +36,46 @@ fn register_decode(reg: u8, w: bool) -> &'static str {
 
 fn address_decode(r_m: u8, a_mod: u8, it: &mut Iter<u8>) -> String {
     let address = match r_m {
-        0b000 => "bx + si",
-        0b001 => "bx + di",
-        0b010 => "bp + si",
-        0b011 => "bp + di",
-        0b100 => "si",
-        0b101 => "di",
-        0b110 => if a_mod == 0b00 { "???" } else { "bp" },
-        0b111 => "bx",
+        0b000 => Some("bx + si"),
+        0b001 => Some("bx + di"),
+        0b010 => Some("bp + si"),
+        0b011 => Some("bp + di"),
+        0b100 => Some("si"),
+        0b101 => Some("di"),
+        0b110 => if a_mod == 0b00 { None } else { Some("bp") },
+        0b111 => Some("bx"),
         _ => panic!("Unrecognized r_m : {r_m}")
     };
 
-    let displacement = match a_mod {
-        0b00 => 0u16,
-        0b01 => {
-            *it.next().unwrap() as u16
-        }
-        0b10 => {
+    let displacement = match (a_mod, address) {
+        (0b00, Some(_)) => 0i16,
+        (0b00, None) => {
             let displacement_l = *it.next().unwrap();
             let displacement_h = *it.next().unwrap();
-            u16::from_le_bytes([displacement_l, displacement_h])
+            i16::from_le_bytes([displacement_l, displacement_h])
+        }
+        (0b01, _) => {
+            (*it.next().unwrap() as i8) as i16
+        }
+        (0b10, _) => {
+            let displacement_l = *it.next().unwrap();
+            let displacement_h = *it.next().unwrap();
+            i16::from_le_bytes([displacement_l, displacement_h])
         }
         _ => panic!("unrecognized a_mod: {a_mod}")
     };
 
-    if displacement == 0 {
-        format!("[{address}]")
+    if let Some(address) = address {
+        match displacement.cmp(&0i16) {
+            Ordering::Less => {
+                let displacement = -displacement;
+                format!("[{address} - {displacement}]")
+            }
+            Ordering::Equal => format!("[{address}]"),
+            Ordering::Greater => format!("[{address} + {displacement}]"),
+        }
     } else {
-        format!("[{address} + {displacement}]")
+        format!("[{displacement}]")
     }
 }
 
@@ -84,7 +99,7 @@ pub fn decode(bytes: &[u8], output: &mut String) {
                         if !d {
                             (reg1, reg2) = (reg2, reg1)
                         }
-                        output.push_str(format!("mov {reg1} {reg2}\n").as_str());
+                        output.push_str(format!("mov {reg1}, {reg2}\n").as_str());
                     }
                     _ => {
                         let d = ((first & 0b00000010) >> 1) == 1;
@@ -94,15 +109,59 @@ pub fn decode(bytes: &[u8], output: &mut String) {
                         let r_m = second & 0b00000111;
                         let memory = address_decode(r_m, a_mod, &mut it);
                         if d {
-                            output.push_str(format!("mov {reg1} {memory}\n").as_str());
+                            output.push_str(format!("mov {reg1}, {memory}\n").as_str());
                         } else {
-                            output.push_str(format!("mov {memory} {reg1}\n").as_str());
+                            output.push_str(format!("mov {memory}, {reg1}\n").as_str());
                         }
                     }
                 }
             }
             x if match_op(x, MOV_IM_REG_MEM) => {
-                println!("TO DO 1");
+                let w = (first & 0b00000001) == 1;
+
+                let second = it.next().unwrap();
+
+                let a_mod = (second & 0b11000000) >> 6;
+
+                match a_mod {
+                    0b11 => {
+                        let reg2 = second & 0b00000111;
+
+                        let reg2 = register_decode(reg2, w);
+
+                        let data1 = *it.next().unwrap();
+                        let mut data2 = 0;
+                        if w {
+                            data2 = *it.next().unwrap();
+                        }
+
+                        let data = i16::from_le_bytes([data1, data2]);
+
+                        if w {
+                            output.push_str(format!("mov {reg2}, word {data}\n").as_str());
+                        } else {
+                            output.push_str(format!("mov {reg2}, byte {data}\n").as_str());
+                        }
+                    }
+                    _ => {
+                        let r_m = second & 0b00000111;
+                        let memory = address_decode(r_m, a_mod, &mut it);
+
+                        let data1 = *it.next().unwrap();
+                        let mut data2 = 0;
+                        if w {
+                            data2 = *it.next().unwrap();
+                        }
+
+                        let data = i16::from_le_bytes([data1, data2]);
+
+                        if w {
+                            output.push_str(format!("mov {memory}, word {data}\n").as_str());
+                        } else {
+                            output.push_str(format!("mov {memory}, byte {data}\n").as_str());
+                        }
+                    }
+                }
             }
             x if match_op(x, MOV_IM_REG) => {
                 let w = ((first & 0b00001000) >> 3) == 1;
@@ -119,7 +178,32 @@ pub fn decode(bytes: &[u8], output: &mut String) {
 
                 let data = i16::from_le_bytes([data1, data2]);
 
-                output.push_str(format!("mov {reg} {data}\n").as_str());
+                output.push_str(format!("mov {reg}, {data}\n").as_str());
+            }
+            x if match_op(x, MOV_MEM_TO_ACC) => {
+                let w = (first & 0b00000001) == 1;
+                let data1 = *it.next().unwrap();
+                let mut data2 = 0;
+                if w {
+                    data2 = *it.next().unwrap();
+                }
+
+                let data = i16::from_le_bytes([data1, data2]);
+
+                output.push_str(format!("mov ax, [{data}]\n").as_str());
+            }
+
+            x if match_op(x, MOV_ACC_TO_MEM) => {
+                let w = (first & 0b00000001) == 1;
+                let data1 = *it.next().unwrap();
+                let mut data2 = 0;
+                if w {
+                    data2 = *it.next().unwrap();
+                }
+
+                let data = i16::from_le_bytes([data1, data2]);
+
+                output.push_str(format!("mov [{data}], ax\n").as_str());
             }
             _x => {
                 panic!("Instruction not recognized : {_x}, output was : \n{output}")
